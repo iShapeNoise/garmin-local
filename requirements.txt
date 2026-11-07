@@ -1,0 +1,8 @@
+garminconnect==0.3.20
+curl_cffi>=0.6
+fitparse
+matplotlib
+pandas
+numpy
+odfpy
+ttkbootstrap   
