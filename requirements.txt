@@ -1,8 +1,15 @@
+# System dependency (not installable via pip):
+#   Windows: included with python.org installer
+#   macOS (Homebrew): brew install python-tk
+#   Linux (Debian/Ubuntu): sudo apt install python3-tk
+
 garminconnect==0.3.20
-curl_cffi>=0.6
+curl_cffi
 fitparse
 matplotlib
 pandas
 numpy
 odfpy
-ttkbootstrap   
+ttkbootstrap
+Pillow
+duckdb   
