@@ -54,11 +54,10 @@ except ImportError:
     ODS_AVAILABLE = False
 
 try:
-    from PIL import Image, ImageDraw, ImageTk
+    from PIL import Image, ImageDraw, ImageTk, ImageFilter
     PIL_AVAILABLE = True
 except ImportError:
     PIL_AVAILABLE = False
-
 
 # ─── Paths ────────────────────────────────────────────────────────────────────
 
@@ -66,7 +65,6 @@ APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = APP_DIR / "data"
 SETTINGS_PATH = DATA_DIR / "settings.json"
 DB_PATH = DATA_DIR / "garmin_data.db"
-
 
 # ─── Settings ─────────────────────────────────────────────────────────────────
 
@@ -79,14 +77,13 @@ def load_settings() -> dict:
     return {"email": "", "password": "", "local_fit_path": "",
             "token_path": "~/.garminconnect",
             "sleep_start": "22:00", "sleep_end": "07:00",
-            "theme": "darkly"}
+            "age": 30, "theme": "darkly"}
 
 
 def save_settings(s: dict):
     DATA_DIR.mkdir(exist_ok=True)
-    SETTINGS_PATH.write_text(json.dumps(s, indent=2))
-
-
+    SETTINGS_PATH.write_text(json.dumps(s, indent=2))   
+    
 # ─── Database ─────────────────────────────────────────────────────────────────
 
 def _get_db():
@@ -154,6 +151,12 @@ def init_db():
         );
         CREATE TABLE IF NOT EXISTS body_battery (
             date TEXT PRIMARY KEY,
+            value REAL,
+            highest REAL,
+            lowest REAL
+        );
+        CREATE TABLE IF NOT EXISTS body_battery_values (
+            timestamp TEXT,
             value REAL
         );
         CREATE TABLE IF NOT EXISTS blood_pressure (
@@ -288,9 +291,25 @@ def db_upsert_body_battery(rows: list):
     conn = _get_db()
     for r in rows:
         conn.execute("""
-            INSERT INTO body_battery (date, value) VALUES (?, ?)
-            ON CONFLICT(date) DO UPDATE SET value=excluded.value
-        """, [r["date"], r["value"]])
+            INSERT INTO body_battery (date, value, highest, lowest) VALUES (?, ?, ?, ?)
+            ON CONFLICT(date) DO UPDATE SET
+                value=excluded.value, highest=excluded.highest, lowest=excluded.lowest
+        """, [r["date"], r["value"], r.get("highest"), r.get("lowest")])
+    conn.close()
+
+
+def db_upsert_body_battery_values(rows: list):
+    if not rows:
+        return
+    conn = _get_db()
+    dates = set()
+    for r in rows:
+        dates.add(r["timestamp"][:10])
+    for d in dates:
+        conn.execute("DELETE FROM body_battery_values WHERE timestamp LIKE ?", [d + "%"])
+    for r in rows:
+        conn.execute("INSERT INTO body_battery_values (timestamp, value) VALUES (?, ?)",
+                     [r["timestamp"], r["value"]])
     conn.close()
 
 
@@ -339,6 +358,7 @@ def db_load_garmin_data() -> dict:
         "respiration": table_to_list("respiration"),
         "activities": [],
         "body_battery": [],
+        "body_battery_values": [],
     }
 
     df_act = conn.execute("SELECT * FROM activities ORDER BY startTimeLocal").fetchdf()
@@ -348,6 +368,10 @@ def db_load_garmin_data() -> dict:
     df_bb = conn.execute("SELECT * FROM body_battery ORDER BY date").fetchdf()
     if not df_bb.empty:
         data["body_battery"] = df_bb.to_dict("records")
+
+    df_bbv = conn.execute("SELECT timestamp, value FROM body_battery_values ORDER BY timestamp").fetchdf()
+    if not df_bbv.empty:
+        data["body_battery_values"] = df_bbv.to_dict("records")
 
     df_lv = conn.execute("SELECT date, start, end_time, level FROM sleep_levels ORDER BY start").fetchdf()
     if not df_lv.empty:
@@ -386,9 +410,8 @@ def db_get_meta(key: str):
     conn = _get_db()
     row = conn.execute("SELECT value FROM meta WHERE key=?", [key]).fetchone()
     conn.close()
-    return row[0] if row else None
-
-
+    return row[0] if row else None   
+    
 # ─── Colors ───────────────────────────────────────────────────────────────────
 
 COLORS = {
@@ -412,8 +435,106 @@ COLORS = {
     "bp_sys":       "#E74C3C",
     "bp_dia":       "#2980B9",
     "bp_pulse":     "#2ECC71",
-}   
-    
+}
+
+BP_COLORS = {
+    "green":  "#2ECC71",
+    "yellow": "#F1C40F",
+    "orange": "#E67E22",
+    "red":    "#E74C3C",
+}
+
+
+def get_bp_color(sys_val, dia_val) -> str:
+    def _cat(s, d):
+        if s >= 180 or d >= 110:
+            return 3
+        elif s >= 160 or d >= 100:
+            return 2
+        elif s >= 140 or d >= 90:
+            return 1
+        else:
+            return 0
+
+    if sys_val is None or (isinstance(sys_val, float) and pd.isna(sys_val)):
+        s = 0
+    else:
+        s = float(sys_val)
+    if dia_val is None or (isinstance(dia_val, float) and pd.isna(dia_val)):
+        d = 0
+    else:
+        d = float(dia_val)
+
+    worst = max(_cat(s, d), _cat(s, 0), _cat(0, d))
+    return [BP_COLORS["green"], BP_COLORS["yellow"], BP_COLORS["orange"], BP_COLORS["red"]][worst]
+
+
+# ─── Sleep Quality Scoring ────────────────────────────────────────────────────
+
+def compute_sleep_quality_score(deep_min, light_min, rem_min, awake_min,
+                                 sleep_time_min, age: int) -> float | None:
+    if sleep_time_min is None or sleep_time_min <= 0:
+        return None
+
+    total = float(sleep_time_min)
+    deep_pct = (deep_min or 0) / total
+    rem_pct  = (rem_min or 0) / total
+    awake_pct = (awake_min or 0) / total
+
+    if age < 30:
+        deep_lo, deep_hi = 0.20, 0.25
+        rem_lo, rem_hi   = 0.22, 0.25
+        awake_cap        = 0.10
+    elif age < 40:
+        deep_lo, deep_hi = 0.16, 0.20
+        rem_lo, rem_hi   = 0.20, 0.24
+        awake_cap        = 0.10
+    elif age < 50:
+        deep_lo, deep_hi = 0.12, 0.18
+        rem_lo, rem_hi   = 0.19, 0.23
+        awake_cap        = 0.12
+    elif age < 60:
+        deep_lo, deep_hi = 0.10, 0.15
+        rem_lo, rem_hi   = 0.18, 0.22
+        awake_cap        = 0.12
+    else:
+        deep_lo, deep_hi = 0.05, 0.12
+        rem_lo, rem_hi   = 0.17, 0.21
+        awake_cap        = 0.15
+
+    if total < 420:
+        dur_score = max(0.0, 30.0 * (total - 300) / 120)
+    elif total <= 540:
+        dur_score = 30.0
+    elif total <= 660:
+        dur_score = max(0.0, 30.0 * (660 - total) / 120)
+    else:
+        dur_score = 0.0
+
+    if deep_lo <= deep_pct <= deep_hi:
+        deep_score = 25.0
+    else:
+        dist = (deep_lo - deep_pct) if deep_pct < deep_lo else (deep_pct - deep_hi)
+        span = max(deep_hi - deep_lo, 0.01)
+        deep_score = max(0.0, 25.0 - (dist / span) * 25.0)
+
+    if rem_lo <= rem_pct <= rem_hi:
+        rem_score = 25.0
+    else:
+        dist = (rem_lo - rem_pct) if rem_pct < rem_lo else (rem_pct - rem_hi)
+        span = max(rem_hi - rem_lo, 0.01)
+        rem_score = max(0.0, 25.0 - (dist / span) * 25.0)
+
+    if awake_pct <= awake_cap * 0.5:
+        awake_score = 20.0
+    elif awake_pct <= awake_cap:
+        awake_score = 20.0 * (1.0 - (awake_pct - awake_cap * 0.5) / (awake_cap * 0.5))
+    else:
+        awake_score = max(0.0, 20.0 - (awake_pct - awake_cap) / awake_cap * 20.0)
+
+    return round(min(100.0, max(0.0, dur_score + deep_score + rem_score + awake_score)), 1)
+
+
 # ─── FIT Reader ───────────────────────────────────────────────────────────────
 
 def read_fit_file(filepath) -> dict:
@@ -452,13 +573,11 @@ def compute_stats(series: pd.Series) -> str:
     s = series.dropna()
     if s.empty:
         return "No data"
-    return f"Avg: {s.mean():.1f}  |  Min: {s.min():.1f}  |  Max: {s.max():.1f}"
-
-
+    return f"Avg: {s.mean():.1f}  |  Min: {s.min():.1f}  |  Max: {s.max():.1f}"   
+    
 # ─── Art Functions ────────────────────────────────────────────────────────────
 
 def art_daily_mosaic(garmin_data: dict, size: int = 3000, metric: str = "steps", palette: str = "thermal") -> Image.Image:
-        
     daily = garmin_data.get("daily_stats", [])
     if not daily:
         img = Image.new("RGB", (size, size), "#0d1117")
@@ -797,7 +916,6 @@ def fetch_incremental(client: Garmin, last_date: date, status_cb=None) -> dict:
 
 
 def save_to_db(merged: dict):
-    """Upsert data into DB. Existing rows are overwritten, new rows are added."""
     if merged.get("daily_stats"):
         db_upsert_daily_stats(merged["daily_stats"])
     if merged.get("heart_rate"):
@@ -812,25 +930,35 @@ def save_to_db(merged: dict):
         db_upsert_activities([dict(a) for a in merged["activities"]])
     if merged.get("body_battery"):
         bb_rows = []
+        bb_values_rows = []
         for e in merged["body_battery"]:
             d = e.get("date") or e.get("calendarDate")
-            v = e.get("charged") or e.get("bodyBattery") or e.get("value")
-            if d and v is not None:
-                bb_rows.append({"date": d, "value": v})
+            if not d:
+                continue
+            arr = e.get("bodyBatteryValuesArray")
+            levels = []
+            if arr:
+                for pair in arr:
+                    if isinstance(pair, (list, tuple)) and len(pair) >= 2:
+                        ts_ms, level = pair[0], pair[1]
+                        if ts_ms and level is not None:
+                            ts_str = pd.Timestamp(ts_ms, unit="ms", tz="UTC").tz_localize(None).isoformat()
+                            bb_values_rows.append({"timestamp": ts_str, "value": float(level)})
+                            levels.append(float(level))
+            if levels:
+                bb_rows.append({
+                    "date": d,
+                    "value": levels[-1],
+                    "highest": max(levels),
+                    "lowest": min(levels),
+                })
+            elif e.get("charged") is not None:
+                bb_rows.append({"date": d, "value": e.get("charged"),
+                                "highest": e.get("charged"), "lowest": 0})
         if bb_rows:
-            db_upsert_body_battery(bb_rows)   
-            
-def load_settings() -> dict:
-    if SETTINGS_PATH.exists():
-        try:
-            return json.loads(SETTINGS_PATH.read_text())
-        except Exception:
-            pass
-    return {"email": "", "password": "", "local_fit_path": "",
-            "token_path": "~/.garminconnect",
-            "sleep_start": "22:00", "sleep_end": "07:00",
-            "theme": "darkly"}
-
+            db_upsert_body_battery(bb_rows)
+        if bb_values_rows:
+            db_upsert_body_battery_values(bb_values_rows)   
             
 # ═══════════════════════════════════════════════════════════════════════════════
 #  GUI APPLICATION
@@ -994,7 +1122,7 @@ class GarminViewerApp:
         c = self._get_chart_colors()
         fig.set_facecolor(c["fig_bg"])
         ax.set_facecolor(c["ax_bg"])
-        ax.tick_params(colors=c["text"], which="both")
+        ax.tick_params(colors=c["text"], which="both", labelsize=11)
         ax.xaxis.label.set_color(c["text"])
         ax.yaxis.label.set_color(c["text"])
         ax.title.set_color(c["text"])
@@ -1003,14 +1131,14 @@ class GarminViewerApp:
         ax.grid(True, alpha=0.3, color=c["grid"])
         if twin_ax is not None:
             twin_ax.set_facecolor(c["ax_bg"])
-            twin_ax.tick_params(colors=c["text"], which="both")
+            twin_ax.tick_params(colors=c["text"], which="both", labelsize=11)
             twin_ax.yaxis.label.set_color(c["text"])
             for spine in twin_ax.spines.values():
                 spine.set_color(c["spine"])
         sb = getattr(self, 'xscrollbar_data', None)
         if sb is not None:
             sb.config(troughcolor=c["fig_bg"], background=c["spine"], activebackground=c["text"])   
-        
+
     # ─── Garmin Tab ─────────────────────────────────────────────────────────
 
     def _build_garmin_tab(self):
@@ -1059,7 +1187,7 @@ class GarminViewerApp:
         Button(local_frame, text="⬇ Import FIT Files", bootstyle="primary",
                command=self._on_local_fit_import).grid(row=1, column=1, padx=5, pady=5, sticky=tk.W)
         Button(local_frame, text="💾 Save to DB", bootstyle="success",
-               command=self._on_local_save_db).grid(row=1, column=1, padx=5, pady=5, sticky=tk.E)   
+               command=self._on_local_save_db).grid(row=1, column=1, padx=5, pady=5, sticky=tk.E)
         self.local_fit_info_var = tk.StringVar(value="")
         ttk.Label(local_frame, textvariable=self.local_fit_info_var).grid(
             row=1, column=2, padx=5, pady=5, sticky=tk.W)
@@ -1078,14 +1206,20 @@ class GarminViewerApp:
         ttk.Label(sleep_frame, text="(e.g. 22:00 → 07:00)",
                   foreground="gray").grid(row=1, column=0, columnspan=4, padx=5, pady=2, sticky=tk.W)
 
+        ttk.Label(sleep_frame, text="Age:").grid(row=2, column=0, padx=5, pady=5, sticky=tk.W)
+        self.age_var = tk.StringVar(value=str(self.settings.get("age", 30)))
+        ttk.Entry(sleep_frame, textvariable=self.age_var, width=5).grid(
+            row=2, column=1, padx=5, pady=5, sticky=tk.W)
+        ttk.Label(sleep_frame, text="(used for sleep quality scoring)",
+                  foreground="gray").grid(row=2, column=2, columnspan=2, padx=5, pady=2, sticky=tk.W)
+
         Button(frame, text="Save Settings", bootstyle="success",
                command=self._save_settings).pack(anchor=tk.W, padx=5, pady=10)
-               
+
     def _on_local_save_db(self):
         if not self.garmin_data.get("daily_stats") and not self.garmin_data.get("activities"):
             messagebox.showinfo("Info", "No data to save. Import first.")
             return
-
         self.status_var.set("💾 Saving to database…")
         self.root.update()
 
@@ -1094,7 +1228,6 @@ class GarminViewerApp:
                 save_to_db(self.garmin_data)
                 db_set_meta("first_download", db_get_meta("first_download") or date.today().isoformat())
                 db_set_meta("last_update", date.today().isoformat())
-                # Reload from DB to ensure chart matches what's actually stored
                 self.garmin_data = db_load_garmin_data()
                 n_days = len(self.garmin_data.get("daily_stats", []))
                 n_acts = len(self.garmin_data.get("activities", []))
@@ -1103,14 +1236,13 @@ class GarminViewerApp:
                 d_max = max(dates) if dates else "?"
                 msg = f"✅ Data saved to database  ({n_days} days: {d_min} → {d_max}, {n_acts} activities)"
             except Exception as e:
-                err_msg = str(e)
-                msg = f"❌ Save failed: {err_msg}"
+                msg = f"❌ Save failed: {str(e)}"
             self.root.after(0, lambda: self.local_fit_info_var.set(msg))
             self.root.after(0, lambda: self.status_var.set(msg))
             self.root.after(0, self._update_data_info)
             self.root.after(0, self._redraw_data_chart)
 
-        threading.Thread(target=work, daemon=True).start()   
+        threading.Thread(target=work, daemon=True).start()
 
     def _save_settings(self):
         self.settings = {
@@ -1120,6 +1252,7 @@ class GarminViewerApp:
             "token_path": self.token_path_var.get().strip(),
             "sleep_start": self.sleep_start_var.get().strip(),
             "sleep_end": self.sleep_end_var.get().strip(),
+            "age": int(self.age_var.get().strip() or 30),
             "theme": self.theme_var.get().strip(),
         }
         save_settings(self.settings)
@@ -1151,7 +1284,6 @@ class GarminViewerApp:
                 root = Path(path).expanduser()
                 data = db_load_garmin_data()
 
-                # ── 1. MONITOR folder ──
                 monitor_dir = root / "Monitor"
                 n_daily = n_hr = n_stress = n_resp = 0
                 if monitor_dir.exists():
@@ -1248,7 +1380,7 @@ class GarminViewerApp:
                                 for d, vals in by_day.items():
                                     if d not in existing:
                                         existing[d] = {"date": d, "avg_stress": int(sum(vals) / len(vals)),
-                                                       "max_stress": int(max(vals)), "min_stress": int(min(vals)),
+                                                                                                              "max_stress": int(max(vals)), "min_stress": int(min(vals)),
                                                        "low_minutes": 0, "medium_minutes": 0, "high_minutes": 0}
                                 data["stress"] = sorted(existing.values(), key=lambda x: x["date"])
                                 n_stress += len(by_day)
@@ -1272,7 +1404,6 @@ class GarminViewerApp:
 
                 self._set_status(f"  → Monitor: {n_daily} days, {n_hr} HR, {n_stress} stress, {n_resp} resp")
 
-                # ── 2. SLEEP folder ──
                 sleep_dir = root / "Sleep"
                 n_sleep = 0
                 if sleep_dir.exists():
@@ -1356,7 +1487,6 @@ class GarminViewerApp:
 
                 self._set_status(f"  → Sleep: {n_sleep} nights")
 
-                # ── 3. ACTIVITY folder ──
                 activity_dir = root / "Activity"
                 if not activity_dir.exists():
                     activity_dir = root / "Sports"
@@ -1401,7 +1531,6 @@ class GarminViewerApp:
 
                 self._set_status(f"  → Activity: {n_acts} imported")
 
-                # Show date range
                 dates = [d["date"] for d in data.get("daily_stats", []) if d.get("date")]
                 d_min = min(dates) if dates else "?"
                 d_max = max(dates) if dates else "?"
@@ -1427,9 +1556,9 @@ class GarminViewerApp:
                 self._close_progress()
                 self.root.after(0, lambda: messagebox.showerror("Import Error", err_msg))
 
-        threading.Thread(target=work, daemon=True).start()   
+        threading.Thread(target=work, daemon=True).start()    
         
-    # ─── Data Monitor Tab ───────────────────────────────────────────────────
+     # ─── Data Monitor Tab ───────────────────────────────────────────────────
 
     def _build_data_tab(self):
         frame = ttk.Frame(self.tab_data)
@@ -1447,7 +1576,7 @@ class GarminViewerApp:
         Button(top, text="🔍 Reset", width=6, bootstyle="secondary",
                command=self._zoom_reset).pack(side=tk.LEFT, padx=2)
         self.data_info_var = tk.StringVar(value="")
-        ttk.Label(top, textvariable=self.data_info_var).pack(side=tk.LEFT, padx=15)   
+        ttk.Label(top, textvariable=self.data_info_var).pack(side=tk.LEFT, padx=15)
 
         chart_frame = ttk.LabelFrame(frame, text="Metric")
         chart_frame.pack(fill=tk.X, padx=5, pady=5)
@@ -1491,6 +1620,16 @@ class GarminViewerApp:
         self.fig_data.canvas.mpl_connect('scroll_event', self._on_data_scroll)
         self._update_data_info()
 
+    def _update_data_info(self):
+        n_days = len(self.garmin_data.get("daily_stats", []))
+        dates = [d["date"] for d in self.garmin_data.get("daily_stats", []) if d.get("date")]
+        d_min = min(dates) if dates else None
+        d_max = max(dates) if dates else None
+        if d_min and d_max:
+            self.data_info_var.set(f"Data: {d_min} → {d_max}  |  {n_days} days")
+        else:
+            self.data_info_var.set("No data yet – click Connect Update or Import")
+
     def _update_data_xscrollbar(self):
         cur_lo, cur_hi = self.ax_data.get_xlim()
         full_lo, full_hi = self._data_x_full_range
@@ -1509,9 +1648,14 @@ class GarminViewerApp:
             return
         center = (x_lo + x_hi) / 2
         half = (x_hi - x_lo) / 4
-        self.ax_data.set_xlim(center - half, center + half)
-        self.fig_data.canvas.draw_idle()
-        self._update_data_xscrollbar()
+        new_lo, new_hi = center - half, center + half
+        if self.data_chart_var.get() == "blood_pressure":
+            self._redraw_data_chart(xlim=(new_lo, new_hi))
+            self._update_data_xscrollbar()
+        else:
+            self.ax_data.set_xlim(new_lo, new_hi)
+            self.fig_data.canvas.draw_idle()
+            self._update_data_xscrollbar()
 
     def _zoom_out(self):
         x_lo, x_hi = self.ax_data.get_xlim()
@@ -1519,26 +1663,24 @@ class GarminViewerApp:
             return
         center = (x_lo + x_hi) / 2
         half = (x_hi - x_lo) * 0.75
-        self.ax_data.set_xlim(center - half, center + half)
-        self.fig_data.canvas.draw_idle()
-        self._update_data_xscrollbar()
+        new_lo, new_hi = center - half, center + half
+        if self.data_chart_var.get() == "blood_pressure":
+            self._redraw_data_chart(xlim=(new_lo, new_hi))
+            self._update_data_xscrollbar()
+        else:
+            self.ax_data.set_xlim(new_lo, new_hi)
+            self.fig_data.canvas.draw_idle()
+            self._update_data_xscrollbar()
 
     def _zoom_reset(self):
         lo, hi = self._data_x_full_range
         if hi > lo:
-            self.ax_data.set_xlim(lo, hi)
-            self.fig_data.canvas.draw_idle()
+            if self.data_chart_var.get() == "blood_pressure":
+                self._redraw_data_chart(xlim=(lo, hi))
+            else:
+                self.ax_data.set_xlim(lo, hi)
+                self.fig_data.canvas.draw_idle()
         self._update_data_xscrollbar()
-
-    def _update_data_info(self):
-        n_days = len(self.garmin_data.get("daily_stats", []))
-        dates = [d["date"] for d in self.garmin_data.get("daily_stats", []) if d.get("date")]
-        d_min = min(dates) if dates else None
-        d_max = max(dates) if dates else None
-        if d_min and d_max:
-            self.data_info_var.set(f"Data: {d_min} → {d_max}  |  {n_days} days")
-        else:
-            self.data_info_var.set("No data yet – click Connect Update or Import")   
 
     def _on_data_scroll(self, event):
         if event.inaxes != self.ax_data:
@@ -1551,9 +1693,14 @@ class GarminViewerApp:
             return
         center = (x_lo + x_hi) / 2
         half = (x_hi - x_lo) / 2 * factor
-        self.ax_data.set_xlim(center - half, center + half)
-        self.fig_data.canvas.draw_idle()
-        self._update_data_xscrollbar()
+        new_lo, new_hi = center - half, center + half
+        if self.data_chart_var.get() == "blood_pressure":
+            self._redraw_data_chart(xlim=(new_lo, new_hi))
+            self._update_data_xscrollbar()
+        else:
+            self.ax_data.set_xlim(new_lo, new_hi)
+            self.fig_data.canvas.draw_idle()
+            self._update_data_xscrollbar()
 
     def _on_data_xscroll(self, *args):
         if self._data_scrolling:
@@ -1574,10 +1721,14 @@ class GarminViewerApp:
             if new_lo < full_lo:
                 new_lo = full_lo
                 new_hi = new_lo + visible
-            self.ax_data.set_xlim(new_lo, new_hi)
-            self.fig_data.canvas.draw_idle()
-            self._update_data_xscrollbar()   
-            
+            if self.data_chart_var.get() == "blood_pressure":
+                self._redraw_data_chart(xlim=(new_lo, new_hi))
+                self._update_data_xscrollbar()
+            else:
+                self.ax_data.set_xlim(new_lo, new_hi)
+                self.fig_data.canvas.draw_idle()
+                self._update_data_xscrollbar()   
+                
     # ─── Download / Update ──────────────────────────────────────────────────
 
     def _get_credentials(self) -> tuple:
@@ -1689,7 +1840,7 @@ class GarminViewerApp:
             ax.legend(handles, labels, loc="upper left", fontsize=8,
                       facecolor=c["legend_bg"], edgecolor=c["spine"], labelcolor=c["text"])
 
-    def _redraw_data_chart(self):
+    def _redraw_data_chart(self, xlim=None):
         if self._data_twin_ax is not None:
             self.fig_data.delaxes(self._data_twin_ax)
             self._data_twin_ax = None
@@ -1759,6 +1910,15 @@ class GarminViewerApp:
         elif choice == "sleep" and self.garmin_data.get("sleep"):
             df = pd.DataFrame(self.garmin_data["sleep"])
             df["date"] = pd.to_datetime(df["date"])
+            age = self.settings.get("age", 30)
+
+            df["quality_score"] = [
+                compute_sleep_quality_score(d.deep_sleep_min, d.light_sleep_min,
+                                            d.rem_sleep_min, d.awake_min,
+                                            d.sleep_time_min, age)
+                for d in df.itertuples()
+            ]
+
             bottom = np.zeros(len(df))
             self.ax_data.bar(df["date"], df["deep_sleep_min"].fillna(0), color=COLORS["sleep_deep"],
                              label="Deep", bottom=bottom, width=0.8)
@@ -1768,12 +1928,22 @@ class GarminViewerApp:
             bottom += df["light_sleep_min"].fillna(0).values
             self.ax_data.bar(df["date"], df["rem_sleep_min"].fillna(0), color=COLORS["sleep_rem"],
                              label="REM", bottom=bottom, width=0.8)
+
+            c = self._get_chart_colors()
+            for i, row in df.iterrows():
+                score = row["quality_score"]
+                if score is not None:
+                    total_h = (row["deep_sleep_min"] or 0) + (row["light_sleep_min"] or 0) + (row["rem_sleep_min"] or 0)
+                    self.ax_data.text(row["date"], total_h + 5, f"{score:.0f}",
+                                      ha="center", va="bottom", fontsize=7,
+                                      color=c["text"], fontweight="bold")
+
             self.ax_data.set_ylabel("Minutes")
-            self.ax_data.set_title("Sleep Summary")
+            self.ax_data.set_title(f"Sleep Summary  (age {age})")
             stats_text = (f"Total: {compute_stats(df['sleep_time_min'])} min   |   "
                           f"Deep: {compute_stats(df['deep_sleep_min'])}   |   "
                           f"REM: {compute_stats(df['rem_sleep_min'])}   |   "
-                          f"Score: {compute_stats(df['sleep_score'])}")
+                          f"Quality: {compute_stats(df['quality_score'])}")
 
         elif choice == "sleep_tracing" and self.garmin_data.get("sleep"):
             sleep_entries = [e for e in self.garmin_data.get("sleep", []) if e.get("sleep_levels")]
@@ -1781,7 +1951,8 @@ class GarminViewerApp:
                 self.ax_data.text(0.5, 0.5, "No sleep tracing data available.",
                                   ha="center", va="center", fontsize=11)
             else:
-                sleep_entries = sorted(sleep_entries, key=lambda x: x["date"])[-14:]
+                sleep_entries = sorted(sleep_entries, key=lambda x: x["date"])
+                sleep_entries = sleep_entries[-14:]
                 n_nights = len(sleep_entries)
                 stage_map = {2: (10, "#2980B9"), 1: (12, "#1ABC9C"), 3: (14, "#9B59B6"), 0: (16, "#F1C40F")}
                 sleep_start = self.settings.get("sleep_start", "22:00")
@@ -1860,28 +2031,44 @@ class GarminViewerApp:
             self.ax_data.set_title("Respiration Rate")
             stats_text = f"Respiration: {compute_stats(df['avg_respiration'])} breaths/min"
 
-        elif choice == "body_battery" and self.garmin_data.get("body_battery"):
-            bb = self.garmin_data["body_battery"]
-            if bb:
-                dates, values = [], []
-                for entry in bb:
-                    d = entry.get("date")
-                    v = entry.get("value")
-                    if d and v is not None:
-                        try:
-                            dates.append(pd.Timestamp(d))
-                            values.append(v)
-                        except Exception:
-                            pass
-                if dates:
-                    self.ax_data.fill_between(dates, values, alpha=0.3, color=COLORS["body_battery"])
-                    self.ax_data.plot(dates, values, color=COLORS["body_battery"],
-                                      linewidth=1.5, label="Body Battery")
-                    self.ax_data.set_ylabel("Points")
-                    self.ax_data.set_title("Body Battery")
-                    stats_text = f"Body Battery: {compute_stats(pd.Series(values))}"
+        elif choice == "body_battery":
+            bbv = self.garmin_data.get("body_battery_values", [])
+            if bbv:
+                df = pd.DataFrame(bbv)
+                df["timestamp"] = pd.to_datetime(df["timestamp"])
+                df = df.sort_values("timestamp")
+                self.ax_data.fill_between(df["timestamp"], df["value"], alpha=0.25, color=COLORS["body_battery"])
+                self.ax_data.plot(df["timestamp"], df["value"], color=COLORS["body_battery"],
+                                  linewidth=1.2, label="Body Battery")
+                self.ax_data.set_ylabel("Points")
+                self.ax_data.set_ylim(0, 100)
+                self.ax_data.set_title("Body Battery (intraday curve)")
+                stats_text = f"Body Battery: {compute_stats(df['value'])}"
+            else:
+                bb = self.garmin_data.get("body_battery", [])
+                if bb:
+                    dates, values = [], []
+                    for entry in bb:
+                        d = entry.get("date")
+                        v = entry.get("value")
+                        if d and v is not None:
+                            try:
+                                dates.append(pd.Timestamp(str(d)))
+                                values.append(float(v))
+                            except (ValueError, TypeError):
+                                continue
+                    if dates:
+                        self.ax_data.plot(dates, values, color=COLORS["body_battery"],
+                                          linewidth=1.5, marker="o", markersize=4, label="Body Battery (daily)")
+                        self.ax_data.set_ylabel("Points")
+                        self.ax_data.set_ylim(0, 100)
+                        self.ax_data.set_title("Body Battery (daily only — no intraday data)")
+                        stats_text = f"Body Battery: {compute_stats(pd.Series(values))}"
+                    else:
+                        self.ax_data.text(0.5, 0.5, "No valid body battery entries",
+                                          ha="center", va="center", fontsize=11)
                 else:
-                    self.ax_data.text(0.5, 0.5, "No valid body battery entries",
+                    self.ax_data.text(0.5, 0.5, "No body battery data",
                                       ha="center", va="center", fontsize=11)
 
         elif choice == "activities" and self.garmin_data.get("activities"):
@@ -1903,11 +2090,61 @@ class GarminViewerApp:
                 df = self.bp_data.copy().sort_values("datetime").reset_index(drop=True)
                 n = len(df)
                 x = np.arange(n)
-                width = 0.3
-                self.ax_data.bar(x - width, df["sys"], width=width, color=COLORS["bp_sys"], label="Systolic")
-                self.ax_data.bar(x, df["dia"], width=width, color=COLORS["bp_dia"], label="Diastolic")
+                width = 0.28
+
+                sys_colors = [get_bp_color(s, d) for s, d in zip(df["sys"], df["dia"])]
+                dia_colors = [get_bp_color(s, d) for s, d in zip(df["sys"], df["dia"])]
+                pulse_colors = ["#2ECC71"] * n
+
+                self.ax_data.bar(x - width, df["sys"], width=width, color=sys_colors, label="Systolic")
+                self.ax_data.bar(x, df["dia"], width=width, color=dia_colors, label="Diastolic")
+                bars_pulse = None
                 if "pulse" in df.columns and df["pulse"].notna().any():
-                    self.ax_data.bar(x + width, df["pulse"], width=width, color=COLORS["bp_pulse"], label="Pulse")
+                    bars_pulse = self.ax_data.bar(x + width, df["pulse"].fillna(0), width=width,
+                                                  color=pulse_colors, label="Pulse")
+
+                if xlim is not None:
+                    x_lo, x_hi = xlim
+                else:
+                    x_lo, x_hi = (0, n - 1)
+                visible_bars = max(1, int(x_hi - x_lo) + 1)
+                px_per_group = 1100.0 / visible_bars
+                val_fontsize = max(5, min(14, px_per_group / 5))
+                cat_fontsize = max(4, min(12, px_per_group / 6))
+
+                c = self._get_chart_colors()
+                label_color = c["text"]
+
+                for i in range(n):
+                    if x[i] < x_lo - 1 or x[i] > x_hi + 1:
+                        continue
+
+                    s_val = df["sys"].iloc[i]
+                    self.ax_data.text(x[i] - width, s_val + 1, f"{s_val:.0f}",
+                                      ha="center", va="bottom", fontsize=val_fontsize, color=label_color)
+                    self.ax_data.text(x[i] - width, 2, "Sys",
+                                      ha="center", va="bottom", fontsize=cat_fontsize,
+                                      color=label_color, fontstyle="italic")
+
+                    d_val = df["dia"].iloc[i]
+                    self.ax_data.text(x[i], d_val + 1, f"{d_val:.0f}",
+                                      ha="center", va="bottom", fontsize=val_fontsize, color=label_color)
+                    self.ax_data.text(x[i], 2, "Dia",
+                                      ha="center", va="bottom", fontsize=cat_fontsize,
+                                      color=label_color, fontstyle="italic")
+
+                    if bars_pulse is not None and pd.notna(df["pulse"].iloc[i]):
+                        p_val = df["pulse"].iloc[i]
+                        self.ax_data.text(x[i] + width, p_val + 1, f"{p_val:.0f}",
+                                          ha="center", va="bottom", fontsize=val_fontsize, color=label_color)
+                        self.ax_data.text(x[i] + width, 2, "Pulse",
+                                          ha="center", va="bottom", fontsize=cat_fontsize,
+                                          color=label_color, fontstyle="italic")
+
+                y_max = max(df["sys"].max(), df["dia"].max(),
+                            df["pulse"].max() if "pulse" in df.columns else 0)
+                self.ax_data.set_ylim(0, y_max * 1.15)
+
                 tick_positions = list(range(n))
                 tick_labels = []
                 prev_date = None
@@ -1935,18 +2172,23 @@ class GarminViewerApp:
                               ha="center", va="center", fontsize=12)
 
         self._safe_legend(self.ax_data, twin_ax)
-        self.ax_data.tick_params(axis="x", rotation=30)
+        self.ax_data.tick_params(axis="x", rotation=30, labelsize=11)
         self._style_figure(self.fig_data, self.ax_data, twin_ax)
         self.fig_data.tight_layout()
+
+        if xlim is not None:
+            self.ax_data.set_xlim(*xlim)
+
         self.canvas_data.draw()
         self.stats_var.set(stats_text)
         x_lo, x_hi = self.ax_data.get_xlim()
         if x_hi > x_lo:
-            self._data_x_full_range = (x_lo, x_hi)
+            if xlim is None:
+                self._data_x_full_range = (x_lo, x_hi)
         self._data_scrolling = True
         self.xscrollbar_data.set(0.0, 1.0)
-        self._data_scrolling = False   
-        
+        self._data_scrolling = False                                                           
+
     # ─── Blood Pressure Tab ─────────────────────────────────────────────────
 
     def _build_bp_tab(self):
@@ -2101,13 +2343,16 @@ class GarminViewerApp:
         "wild_mix":      "Wild Mix",
     }
 
-    _ART_DATA_SOURCES = {
-        "daily_stats":    "Daily Stats (Steps/Cal)",
-        "heart_rate":     "Heart Rate",
-        "stress":         "Stress",
-        "sleep":          "Sleep",
-        "respiration":    "Respiration",
-        "body_battery":   "Body Battery",
+    _ART_DATA_LABELS = {
+        "steps": "Steps & Distance",
+        "calories": "Calories",
+        "heart_rate": "Heart Rate",
+        "stress": "Stress",
+        "sleep": "Sleep Summary",
+        "sleep_tracing": "Sleep Tracing",
+        "respiration": "Respiration",
+        "body_battery": "Body Battery",
+        "activities": "Activities",
         "blood_pressure": "Blood Pressure",
     }
 
@@ -2115,11 +2360,9 @@ class GarminViewerApp:
         frame = ttk.Frame(self.tab_art)
         frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
-        # ── Top controls ──
         ctrl = ttk.LabelFrame(frame, text="Art Settings")
         ctrl.pack(fill=tk.X, padx=5, pady=5)
 
-        # Row 0: Style
         ttk.Label(ctrl, text="Style:").grid(row=0, column=0, padx=5, pady=4, sticky=tk.W)
         self.art_style_var = tk.StringVar(value="scribble")
         style_frame = ttk.Frame(ctrl)
@@ -2130,20 +2373,14 @@ class GarminViewerApp:
                             command=self._on_art_style_changed).grid(
                 row=0, column=i, padx=6, pady=2, sticky=tk.W)
 
-        # Row 1: Data source + Metric
         ttk.Label(ctrl, text="Data:").grid(row=1, column=0, padx=5, pady=4, sticky=tk.W)
-        self.art_data_var = tk.StringVar(value="stress")
+        self.art_data_var = tk.StringVar(value="steps")
         self.art_data_combo = ttk.Combobox(ctrl, textvariable=self.art_data_var,
-                                           values=list(self._ART_DATA_SOURCES.keys()),
-                                           width=16, state="readonly")
+                                           values=list(self._ART_DATA_LABELS.keys()),
+                                           width=20, state="readonly")
         self.art_data_combo.bind("<<ComboboxSelected>>", lambda e: self._on_art_data_changed())
-        ttk.Label(ctrl, text="Metric:").grid(row=1, column=2, padx=5, pady=4, sticky=tk.W)
-        self.art_metric_var = tk.StringVar(value="avg_stress")
-        self.art_metric_combo = ttk.Combobox(ctrl, textvariable=self.art_metric_var,
-                                             values=[], width=14, state="readonly")
-        self.art_metric_combo.grid(row=1, column=3, padx=5, pady=4, sticky=tk.W)
+        self.art_data_combo.grid(row=1, column=1, columnspan=2, padx=5, pady=4, sticky=tk.W)
 
-        # Row 2: Period (Weekly / Monthly) + Period dropdown
         ttk.Label(ctrl, text="Period:").grid(row=2, column=0, padx=5, pady=4, sticky=tk.W)
         self.art_period_var = tk.StringVar(value="weekly")
         ttk.Radiobutton(ctrl, text="Weekly", value="weekly",
@@ -2162,7 +2399,6 @@ class GarminViewerApp:
                                                     values=[], width=18, state="readonly")
         self.art_period_select_combo.grid(row=2, column=4, columnspan=2, padx=5, pady=4, sticky=tk.W)
 
-        # Row 3: Palette + Size
         ttk.Label(ctrl, text="Palette:").grid(row=3, column=0, padx=5, pady=4, sticky=tk.W)
         self.art_palette_var = tk.StringVar(value="thermal")
         palettes = ["thermal", "ocean", "neon", "rainbow"]
@@ -2177,7 +2413,6 @@ class GarminViewerApp:
                                            values=sizes, width=6, state="readonly")
         self.art_size_combo.grid(row=3, column=3, padx=5, pady=4, sticky=tk.W)
 
-        # ── Buttons ──
         btn_row = ttk.Frame(frame)
         btn_row.pack(fill=tk.X, padx=5, pady=5)
         Button(btn_row, text="🎨 Generate", bootstyle="primary",
@@ -2187,7 +2422,6 @@ class GarminViewerApp:
         self.art_info_var = tk.StringVar(value="")
         ttk.Label(btn_row, textvariable=self.art_info_var).pack(side=tk.LEFT, padx=15)
 
-        # ── Preview ──
         preview_frame = ttk.Frame(frame)
         preview_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
         self.art_preview_label = tk.Label(preview_frame, text="Art will appear here",
@@ -2197,78 +2431,88 @@ class GarminViewerApp:
         self._art_image = None
         self._art_photo = None
 
-        # Initialize period dropdown
         self._on_art_period_changed()
 
-    # ── Art helpers ──
-
     def _on_art_style_changed(self):
-        """Show/hide metric combo based on style."""
-        style = self.art_style_var.get()
-        needs_metric = style in ("daily_mosaic", "scribble", "kandinsky",
-                                  "mondrian", "rothko", "pollock", "bauhaus", "wild_mix")
-        if needs_metric:
-            self.art_metric_combo.state(["!disabled"])
-            self._populate_art_metrics()
-        else:
-            self.art_metric_combo.state(["disabled"])
+        pass
 
     def _on_art_data_changed(self):
-        self._populate_art_metrics()
         self._populate_art_periods()
 
     def _on_art_period_changed(self):
-        """Rebuild the period dropdown when Weekly/Monthly is toggled."""
         self._populate_art_periods()
 
-    def _populate_art_metrics(self):
-        """Set available metrics for the selected data source."""
-        data_key = self.art_data_var.get()
-        metrics_map = {
-            "daily_stats":    ["steps", "calories", "active_calories", "distance_km"],
-            "heart_rate":     ["resting_hr", "max_hr", "min_hr"],
-            "stress":         ["avg_stress", "max_stress", "min_stress",
-                               "low_minutes", "medium_minutes", "high_minutes"],
-            "sleep":          ["sleep_time_min", "deep_sleep_min", "light_sleep_min",
-                               "rem_sleep_min", "awake_min", "sleep_score"],
-            "respiration":    ["avg_respiration", "max_respiration", "min_respiration"],
-            "body_battery":   ["value"],
-            "blood_pressure": ["sys", "dia", "pulse"],
-        }
-        vals = metrics_map.get(data_key, [])
-        self.art_metric_combo.configure(values=vals)
-        if vals:
-            self.art_metric_var.set(vals[0])
-
     def _populate_art_periods(self):
-        """Populate the period dropdown with available weeks or months."""
         period_mode = self.art_period_var.get()
         data_key = self.art_data_var.get()
-
-        # Get dates from the relevant data source
         dates = self._get_dates_for_data_source(data_key)
         if not dates:
             self.art_period_select_combo.configure(values=[])
             self.art_period_select_var.set("")
             return
-
         if period_mode == "weekly":
             weeks = sorted(set(d.isocalendar()[0:2] for d in dates))
             labels = [f"{y}-W{w:02d}" for y, w in weeks]
         else:
             months = sorted(set((d.year, d.month) for d in dates))
             labels = [f"{y}-{m:02d}" for y, m in months]
-
         self.art_period_select_combo.configure(values=labels)
         if labels:
-            self.art_period_select_var.set(labels[-1])  # default to latest
+            self.art_period_select_var.set(labels[-1])
 
     def _get_dates_for_data_source(self, data_key: str) -> list:
-        """Extract a list of pd.Timestamp dates from the given data source."""
         if data_key == "blood_pressure":
             if self.bp_data is not None and not self.bp_data.empty:
                 return list(self.bp_data["datetime"].dropna())
             return []
+        if data_key == "body_battery":
+            bbv = self.garmin_data.get("body_battery_values", [])
+            if bbv:
+                dates = []
+                for entry in bbv:
+                    ts = entry.get("timestamp")
+                    if ts:
+                        try:
+                            dates.append(pd.Timestamp(ts))
+                        except Exception:
+                            pass
+                if dates:
+                    return dates
+            data = self.garmin_data.get("body_battery", [])
+            if not data:
+                return []
+            dates = []
+            for entry in data:
+                d = entry.get("date")
+                if d:
+                    try:
+                        dates.append(pd.Timestamp(d))
+                    except Exception:
+                        pass
+            return dates
+        if data_key == "sleep_tracing":
+            data = self.garmin_data.get("sleep", [])
+            dates = []
+            for entry in data:
+                if entry.get("sleep_levels"):
+                    d = entry.get("date")
+                    if d:
+                        try:
+                            dates.append(pd.Timestamp(d))
+                        except Exception:
+                            pass
+            return dates
+        if data_key == "activities":
+            data = self.garmin_data.get("activities", [])
+            dates = []
+            for entry in data:
+                d = entry.get("startTimeLocal") or entry.get("startTimeGMT")
+                if d:
+                    try:
+                        dates.append(pd.Timestamp(d))
+                    except Exception:
+                        pass
+            return dates
         data = self.garmin_data.get(data_key, [])
         if not data:
             return []
@@ -2283,24 +2527,20 @@ class GarminViewerApp:
         return dates
 
     def _get_period_date_range(self) -> tuple:
-        """Return (start_date, end_date) for the selected period."""
         period_mode = self.art_period_var.get()
         selected = self.art_period_select_var.get()
         if not selected:
             return None, None
         if period_mode == "weekly":
-            # Format: "2025-W42"
             try:
                 year, week = selected.split("-W")
                 year, week = int(year), int(week)
-                # Monday of that ISO week
                 start = date.fromisocalendar(year, week, 1)
                 end = date.fromisocalendar(year, week, 7)
                 return pd.Timestamp(start), pd.Timestamp(end)
             except Exception:
                 return None, None
         else:
-            # Format: "2025-06"
             try:
                 year, month = map(int, selected.split("-"))
                 start = pd.Timestamp(year=year, month=month, day=1)
@@ -2310,24 +2550,13 @@ class GarminViewerApp:
                 return None, None
 
     def _extract_art_data(self) -> dict:
-        """Extract min/avg/max arrays and color data for the selected period.
-
-        Returns a dict with keys:
-            data_min, data_avg, data_max  – arrays of floats (normalized 0-1 for scribble)
-            raw_min, raw_avg, raw_max     – raw values (for labels)
-            color_values                   – per-day values for color mapping
-            title                          – display title
-            value_label                    – summary string
-            n_points                       – number of data points
-        """
         data_key = self.art_data_var.get()
-        metric = self.art_metric_var.get()
         start, end = self._get_period_date_range()
-
         if start is None:
             return {}
 
-        # Get relevant rows in range
+        label = self._ART_DATA_LABELS.get(data_key, data_key)
+
         if data_key == "blood_pressure":
             if self.bp_data is None or self.bp_data.empty:
                 return {}
@@ -2335,90 +2564,149 @@ class GarminViewerApp:
                               (self.bp_data["datetime"] <= end)].copy()
             if df.empty:
                 return {}
-            # Group by day
             df["day"] = df["datetime"].dt.date
-            daily = df.groupby("day")[metric].agg(["min", "mean", "max"]).reset_index()
+            daily = df.groupby("day").agg({"sys": "mean", "dia": "mean"}).reset_index()
             daily = daily.sort_values("day")
-            raw_min = daily["min"].tolist()
-            raw_avg = daily["mean"].tolist()
-            raw_max = daily["max"].tolist()
-            color_values = daily["mean"].tolist()
+            raw_avg = ((daily["sys"] + daily["dia"]) / 2).tolist()
+            raw_min = daily["dia"].tolist()
+            raw_max = daily["sys"].tolist()
+            color_values = raw_avg[:]
             n_points = len(daily)
-            title = f"BP {metric}"
-            value_label = f"avg: {np.mean(raw_avg):.1f}"
+            value_label = f"avg sys: {daily['sys'].mean():.0f}  |  avg dia: {daily['dia'].mean():.0f}"
 
-        else:
-            data = self.garmin_data.get(data_key, [])
-            if not data:
-                return {}
-            # Filter by date range
+        elif data_key == "body_battery":
+            bbv = self.garmin_data.get("body_battery_values", [])
+            if bbv:
+                df = pd.DataFrame(bbv)
+                df["timestamp"] = pd.to_datetime(df["timestamp"])
+                df = df[(df["timestamp"] >= start) & (df["timestamp"] <= end)]
+                if df.empty:
+                    return {}
+                df["day"] = df["timestamp"].dt.date
+                daily = df.groupby("day")["value"].mean().reset_index().sort_values("day")
+                raw_avg = daily["value"].tolist()
+            else:
+                data = self.garmin_data.get("body_battery", [])
+                filtered = [e for e in data if start <= pd.Timestamp(e.get("date", "")) <= end]
+                if not filtered:
+                    return {}
+                raw_avg = [e.get("value", 0) or 0 for e in filtered]
+            raw_min = [max(0, v * 0.7) for v in raw_avg]
+            raw_max = [min(100, v * 1.2) for v in raw_avg]
+            color_values = raw_avg[:]
+            n_points = len(raw_avg)
+            value_label = f"avg: {np.mean(raw_avg):.0f}  |  {n_points} days"
+
+        elif data_key == "sleep_tracing":
+            sleep = [e for e in self.garmin_data.get("sleep", []) if e.get("sleep_levels")]
             filtered = []
-            for entry in data:
-                d = entry.get("date")
-                if not d:
-                    continue
-                try:
-                    ts = pd.Timestamp(d)
-                except Exception:
-                    continue
-                if start <= ts <= end:
-                    filtered.append(entry)
+            for e in sleep:
+                d = e.get("date")
+                if d and start <= pd.Timestamp(d) <= end:
+                    filtered.append(e)
             if not filtered:
                 return {}
-
-            # For stress, build min/avg/max from the 3 columns
-            if data_key == "stress" and metric == "avg_stress":
-                raw_min = [e.get("min_stress") or 0 for e in filtered]
-                raw_avg = [e.get("avg_stress") or 0 for e in filtered]
-                raw_max = [e.get("max_stress") or 0 for e in filtered]
-            elif data_key == "heart_rate" and metric == "resting_hr":
-                raw_min = [e.get("min_hr") or 0 for e in filtered]
-                raw_avg = [e.get("resting_hr") or 0 for e in filtered]
-                raw_max = [e.get("max_hr") or 0 for e in filtered]
-            elif data_key == "respiration" and metric == "avg_respiration":
-                raw_min = [e.get("min_respiration") or 0 for e in filtered]
-                raw_avg = [e.get("avg_respiration") or 0 for e in filtered]
-                raw_max = [e.get("max_respiration") or 0 for e in filtered]
-            elif data_key == "sleep":
-                # Use sleep stages as min/avg/max proxy
-                raw_min = [e.get("awake_min") or 0 for e in filtered]
-                raw_avg = [e.get("sleep_time_min") or 0 for e in filtered]
-                raw_max = [e.get("sleep_time_min") or 0 for e in filtered]
-                # Better: use deep as "low", total as "avg", score-scaled as "max"
-                raw_min = [e.get("deep_sleep_min") or 0 for e in filtered]
-                raw_avg = [e.get("light_sleep_min") or 0 for e in filtered]
-                raw_max = [e.get("rem_sleep_min") or 0 for e in filtered]
-            else:
-                vals = [e.get(metric) or 0 for e in filtered]
-                raw_avg = vals
-                raw_min = [max(0, v * 0.8) for v in vals]
-                raw_max = [v * 1.1 for v in vals]
-
+            raw_avg = [(e.get("deep_sleep_min", 0) or 0) + (e.get("rem_sleep_min", 0) or 0) for e in filtered]
+            raw_min = [e.get("deep_sleep_min", 0) or 0 for e in filtered]
+            raw_max = [e.get("sleep_time_min", 0) or 0 for e in filtered]
             color_values = raw_avg[:]
             n_points = len(filtered)
+            value_label = f"{n_points} nights  |  avg quality: {np.mean(raw_avg):.0f} min"
 
-            # Title
-            period_label = self.art_period_select_var.get()
-            source_label = self._ART_DATA_SOURCES.get(data_key, data_key)
-            title = f"{source_label} – {period_label}"
+        elif data_key == "activities":
+            acts = self.garmin_data.get("activities", [])
+            filtered = []
+            for a in acts:
+                d = a.get("startTimeLocal") or a.get("startTimeGMT")
+                if d and start <= pd.Timestamp(d) <= end:
+                    filtered.append(a)
+            if not filtered:
+                return {}
+            raw_avg = [a.get("duration", 0) or 0 for a in filtered]
+            raw_min = [max(0, v * 0.5) for v in raw_avg]
+            raw_max = [v * 1.5 for v in raw_avg]
+            color_values = raw_avg[:]
+            n_points = len(filtered)
+            value_label = f"{n_points} activities"
 
-            # Value label
-            if raw_avg:
-                avg_val = np.mean(raw_avg)
-                unit = ""
-                if "min" in metric or "minutes" in metric:
-                    unit = " min"
-                elif "hr" in metric or metric in ("sys", "dia", "pulse"):
-                    unit = " bpm" if metric == "pulse" else ""
-                elif "cal" in metric:
-                    unit = " kcal"
-                elif "km" in metric:
-                    unit = " km"
-                value_label = f"avg: {avg_val:.1f}{unit}  |  {n_points} days"
-            else:
-                value_label = ""
+        elif data_key == "steps":
+            data = self.garmin_data.get("daily_stats", [])
+            filtered = [e for e in data if start <= pd.Timestamp(e.get("date", "")) <= end]
+            if not filtered:
+                return {}
+            raw_avg = [e.get("steps", 0) or 0 for e in filtered]
+            raw_min = [e.get("distance_km", 0) or 0 for e in filtered]
+            raw_max = raw_avg[:]
+            color_values = raw_avg[:]
+            n_points = len(filtered)
+            value_label = f"avg steps: {np.mean(raw_avg):.0f}  |  {n_points} days"
 
-        # Normalize for scribble
+        elif data_key == "calories":
+            data = self.garmin_data.get("daily_stats", [])
+            filtered = [e for e in data if start <= pd.Timestamp(e.get("date", "")) <= end]
+            if not filtered:
+                return {}
+            raw_avg = [e.get("calories", 0) or 0 for e in filtered]
+            raw_min = [e.get("active_calories", 0) or 0 for e in filtered]
+            raw_max = raw_avg[:]
+            color_values = raw_avg[:]
+            n_points = len(filtered)
+            value_label = f"avg: {np.mean(raw_avg):.0f} kcal  |  {n_points} days"
+
+        elif data_key == "heart_rate":
+            data = self.garmin_data.get("heart_rate", [])
+            filtered = [e for e in data if start <= pd.Timestamp(e.get("date", "")) <= end]
+            if not filtered:
+                return {}
+            raw_avg = [e.get("resting_hr", 0) or 0 for e in filtered]
+            raw_min = [e.get("min_hr", 0) or 0 for e in filtered]
+            raw_max = [e.get("max_hr", 0) or 0 for e in filtered]
+            color_values = raw_avg[:]
+            n_points = len(filtered)
+            value_label = f"avg resting: {np.mean(raw_avg):.0f} bpm"
+
+        elif data_key == "stress":
+            data = self.garmin_data.get("stress", [])
+            filtered = [e for e in data if start <= pd.Timestamp(e.get("date", "")) <= end]
+            if not filtered:
+                return {}
+            raw_avg = [e.get("avg_stress", 0) or 0 for e in filtered]
+            raw_min = [e.get("min_stress", 0) or 0 for e in filtered]
+            raw_max = [e.get("max_stress", 0) or 0 for e in filtered]
+            color_values = raw_avg[:]
+            n_points = len(filtered)
+            value_label = f"avg stress: {np.mean(raw_avg):.0f}"
+
+        elif data_key == "sleep":
+            data = self.garmin_data.get("sleep", [])
+            filtered = [e for e in data if start <= pd.Timestamp(e.get("date", "")) <= end]
+            if not filtered:
+                return {}
+            raw_avg = [e.get("sleep_time_min", 0) or 0 for e in filtered]
+            raw_min = [e.get("deep_sleep_min", 0) or 0 for e in filtered]
+            raw_max = [e.get("awake_min", 0) or 0 for e in filtered]
+            color_values = raw_avg[:]
+            n_points = len(filtered)
+            value_label = f"avg sleep: {np.mean(raw_avg)/60:.1f} h  |  {n_points} nights"
+
+        elif data_key == "respiration":
+            data = self.garmin_data.get("respiration", [])
+            filtered = [e for e in data if start <= pd.Timestamp(e.get("date", "")) <= end]
+            if not filtered:
+                return {}
+            raw_avg = [e.get("avg_respiration", 0) or 0 for e in filtered]
+            raw_min = [e.get("min_respiration", 0) or 0 for e in filtered]
+            raw_max = [e.get("max_respiration", 0) or 0 for e in filtered]
+            color_values = raw_avg[:]
+            n_points = len(filtered)
+            value_label = f"avg: {np.mean(raw_avg):.1f} br/min"
+
+        else:
+            return {}
+
+        period_label = self.art_period_select_var.get()
+        title = f"{label} – {period_label}"
+
         all_vals = raw_min + raw_avg + raw_max
         v_min, v_max = min(all_vals), max(all_vals)
         v_range = v_max - v_min or 1
@@ -2427,49 +2715,20 @@ class GarminViewerApp:
         data_max = [(v - v_min) / v_range for v in raw_max]
 
         return {
-            "data_min": data_min,
-            "data_avg": data_avg,
-            "data_max": data_max,
-            "raw_min": raw_min,
-            "raw_avg": raw_avg,
-            "raw_max": raw_max,
-            "color_values": color_values,
-            "title": title,
-            "value_label": value_label,
-            "n_points": n_points,
+            "data_min": data_min, "data_avg": data_avg, "data_max": data_max,
+            "raw_min": raw_min, "raw_avg": raw_avg, "raw_max": raw_max,
+            "color_values": color_values, "title": title,
+            "value_label": value_label, "n_points": n_points,
         }
 
-    # ── Data-driven color palettes for art ──
-
     _DATA_PALETTES = {
-        "thermal": {
-            "low":  (30, 40, 80),
-            "mid":  (255, 100, 30),
-            "high": (255, 30, 30),
-            "bg":   (13, 17, 23),
-        },
-        "ocean": {
-            "low":  (10, 20, 60),
-            "mid":  (0, 150, 180),
-            "high": (100, 230, 255),
-            "bg":   (5, 10, 30),
-        },
-        "neon": {
-            "low":  (40, 10, 80),
-            "mid":  (200, 50, 255),
-            "high": (50, 255, 150),
-            "bg":   (15, 5, 25),
-        },
-        "rainbow": {
-            "low":  (255, 0, 0),
-            "mid":  (255, 255, 0),
-            "high": (0, 200, 0),
-            "bg":   (20, 20, 20),
-        },
+        "thermal": {"low": (30, 40, 80), "mid": (255, 100, 30), "high": (255, 30, 30), "bg": (13, 17, 23)},
+        "ocean":   {"low": (10, 20, 60), "mid": (0, 150, 180), "high": (100, 230, 255), "bg": (5, 10, 30)},
+        "neon":    {"low": (40, 10, 80), "mid": (200, 50, 255), "high": (50, 255, 150), "bg": (15, 5, 25)},
+        "rainbow": {"low": (255, 0, 0), "mid": (255, 255, 0), "high": (0, 200, 0), "bg": (20, 20, 20)},
     }
 
     def _lerp_data_color(self, t: float, palette: str) -> tuple:
-        """Interpolate a color based on normalized value t (0-1) and palette."""
         stops = self._DATA_PALETTES.get(palette, self._DATA_PALETTES["thermal"])
         if t <= 0.5:
             c0, c1 = stops["low"], stops["mid"]
@@ -2479,18 +2738,14 @@ class GarminViewerApp:
             lt = (t - 0.5) * 2
         return tuple(int(c0[i] + (c1[i] - c0[i]) * lt) for i in range(3))
 
-    # ── Art generation (data-driven wrappers) ──
-
     def _generate_art_image(self) -> Image.Image:
-        """Dispatch to the correct art function with real data."""
         style = self.art_style_var.get()
         size = int(self.art_size_var.get())
         palette = self.art_palette_var.get()
-        metric = self.art_metric_var.get()
         data = self._extract_art_data()
 
         if style == "daily_mosaic":
-            return self._art_daily_mosaic_data(data, size, metric, palette)
+            return self._art_daily_mosaic_data(data, size, palette)
         elif style == "sleep_heatmap":
             return self._art_sleep_heatmap_data(data, size, palette)
         elif style == "bp_wave":
@@ -2512,13 +2767,11 @@ class GarminViewerApp:
         else:
             raise ValueError(f"Unknown style: {style}")
 
-    def _art_daily_mosaic_data(self, data: dict, size: int, metric: str, palette: str) -> Image.Image:
-        """Mosaic where each cell color = that day's value mapped through palette."""
+    def _art_daily_mosaic_data(self, data: dict, size: int, palette: str) -> Image.Image:
         if not data or data["n_points"] == 0:
             img = Image.new("RGB", (size, size), "#0d1117")
             ImageDraw.Draw(img).text((size // 2, size // 2), "No data", fill="#888")
             return img
-
         values = data["color_values"]
         n = len(values)
         cols = int(np.ceil(np.sqrt(n)))
@@ -2527,24 +2780,19 @@ class GarminViewerApp:
         img_size = max(cols * cell, rows * cell)
         img = Image.new("RGB", (img_size, img_size), "#0d1117")
         draw = ImageDraw.Draw(img)
-
         v_min, v_max = min(values), max(values)
         v_range = v_max - v_min or 1
-
         for i, val in enumerate(values):
             col, row = i % cols, i // cols
             x0, y0 = col * cell, row * cell
             t = (val - v_min) / v_range
             color = self._lerp_data_color(t, palette)
             draw.rectangle([x0 + 1, y0 + 1, x0 + cell - 1, y0 + cell - 1], fill=color)
-
-        # Labels
         draw.text((20, 20), data["title"], fill="#ffffff")
         draw.text((20, 45), data["value_label"], fill="#aaa")
         return img
 
     def _art_sleep_heatmap_data(self, data: dict, size: int, palette: str) -> Image.Image:
-        """Sleep heatmap using actual stage proportions from the selected period."""
         start, end = self._get_period_date_range()
         sleep_data = self.garmin_data.get("sleep", [])
         filtered = []
@@ -2558,32 +2806,24 @@ class GarminViewerApp:
                 continue
             if start and end and start <= ts <= end:
                 filtered.append(e)
-
         if not filtered:
             img = Image.new("RGB", (size, size), "#0d1117")
             ImageDraw.Draw(img).text((size // 2, size // 2), "No sleep data", fill="#888")
             return img
-
         palettes = {
-            "thermal": {"deep": (27, 42, 74), "light": (93, 173, 226),
-                        "rem": (244, 208, 63), "awake": (231, 76, 60)},
-            "ocean":   {"deep": (10, 25, 60), "light": (0, 140, 170),
-                        "rem": (100, 220, 200), "awake": (255, 120, 80)},
-            "neon":    {"deep": (50, 10, 100), "light": (0, 220, 255),
-                        "rem": (255, 80, 200), "awake": (50, 255, 100)},
-            "rainbow": {"deep": (180, 0, 60), "light": (0, 150, 200),
-                        "rem": (255, 200, 0), "awake": (50, 200, 50)},
+            "thermal": {"deep": (27, 42, 74), "light": (93, 173, 226), "rem": (244, 208, 63), "awake": (231, 76, 60)},
+            "ocean":   {"deep": (10, 25, 60), "light": (0, 140, 170), "rem": (100, 220, 200), "awake": (255, 120, 80)},
+            "neon":    {"deep": (50, 10, 100), "light": (0, 220, 255), "rem": (255, 80, 200), "awake": (50, 255, 100)},
+            "rainbow": {"deep": (180, 0, 60), "light": (0, 150, 200), "rem": (255, 200, 0), "awake": (50, 200, 50)},
         }
         colors = palettes.get(palette, palettes["thermal"])
         n = len(filtered)
         bar_h = max(6, int(size * 0.7 / max(n, 1)))
         img = Image.new("RGB", (size, size), "#0d1117")
         draw = ImageDraw.Draw(img)
-
         max_total = max(
             (s.get("deep_sleep_min", 0) + s.get("light_sleep_min", 0) +
              s.get("rem_sleep_min", 0) + s.get("awake_min", 0)) or 0 for s in filtered) or 1
-
         y_start = int(size * 0.15)
         for i, s in enumerate(filtered):
             y = y_start + i * bar_h
@@ -2597,124 +2837,117 @@ class GarminViewerApp:
                 if w > 0:
                     draw.rectangle([x, y, x + w, y + bar_h - 1], fill=colors[key])
                     x += w
-
-        # Legend
         ly = int(size * 0.08)
         for j, (label, color) in enumerate(colors.items()):
             lx = int(size * 0.15) + j * 140
             draw.rectangle([lx, ly, lx + 16, ly + 16], fill=color)
             draw.text((lx + 22, ly), label.capitalize(), fill="#ccc")
-
         draw.text((20, 20), data.get("title", "Sleep"), fill="#ffffff")
         draw.text((20, 45), data.get("value_label", ""), fill="#aaa")
         return img
 
     def _art_scribble_data(self, data: dict, size: int, palette: str) -> Image.Image:
-        """Scribble style driven by real min/avg/max data."""
         if not data or data["n_points"] == 0:
             img = Image.new("RGB", (size, size), "#faf8f5")
             ImageDraw.Draw(img).text((size // 2, size // 2), "No data", fill="#888")
             return img
-
-        # Use data-driven palette for scribble colors
         pal = self._DATA_PALETTES.get(palette, self._DATA_PALETTES["thermal"])
-        scribble_colors = [
-            pal["low"], pal["mid"], pal["high"],
-            (80, 140, 100), (120, 60, 140), (200, 100, 60),
-        ]
+        scribble_colors = [pal["low"], pal["mid"], pal["high"],
+                           (80, 140, 100), (120, 60, 140), (200, 100, 60)]
+        img = self._style_scribble(size, size, data["data_min"], data["data_avg"],
+                                   data["data_max"], data["title"], data["value_label"], scribble_colors)
+        return img
 
-        # Call the scribble function with real data
-        img = style_scribble(
-            size, size,
-            data_min=data["data_min"],
-            data_avg=data["data_avg"],
-            data_max=data["data_max"],
-            title=data["title"],
-            value_label=data["value_label"],
-        )
+    def _style_scribble(self, w, h, data_min, data_avg, data_max, title, value_label, colors):
+        img = Image.new("RGB", (w, h), (250, 248, 245))
+        draw = ImageDraw.Draw(img)
+        import random as _rnd
+        _rnd.seed(42)
+        n = len(data_avg)
+        for i in range(n):
+            x = int(50 + (w - 100) * i / max(n - 1, 1))
+            y_min = int(h - 100 - data_min[i] * (h - 200))
+            y_avg = int(h - 100 - data_avg[i] * (h - 200))
+            y_max = int(h - 100 - data_max[i] * (h - 200))
+            for j in range(3):
+                cx = x + _rnd.randint(-10, 10)
+                cy = [y_min, y_avg, y_max][j] + _rnd.randint(-10, 10)
+                r = _rnd.randint(5, 20)
+                draw.ellipse([cx - r, cy - r, cx + r, cy + r],
+                             fill=colors[j % len(colors)], outline=None)
+        draw.text((20, 20), title, fill=(30, 30, 30))
+        draw.text((20, 45), value_label, fill=(80, 80, 80))
         return img
 
     def _art_kandinsky_data(self, data: dict, size: int, palette: str) -> Image.Image:
-        """Kandinsky where shape density and color are driven by data values."""
         if not data or data["n_points"] == 0:
             img = Image.new("RGB", (size, size), "#0d1117")
             ImageDraw.Draw(img).text((size // 2, size // 2), "No data", fill="#888")
             return img
-
+        import random as _rnd
+        _rnd.seed(42)
         img = Image.new("RGB", (size, size), (255, 255, 255))
         draw = ImageDraw.Draw(img)
         values = data["color_values"]
         v_min, v_max = min(values), max(values)
         v_range = v_max - v_min or 1
         n = len(values)
-        # More data points → more shapes
         n_shapes = max(20, n * 3)
-
         for i in range(n_shapes):
-            # Map shape to a data point for color
             idx = i % n
             t = (values[idx] - v_min) / v_range
             color = self._lerp_data_color(t, palette)
-            cx, cy = random.randint(20, size - 20), random.randint(20, size - 20)
-            size_shape = random.randint(15, 100)
-            shape = random.choice(['circle', 'triangle', 'square', 'line'])
+            cx, cy = _rnd.randint(20, size - 20), _rnd.randint(20, size - 20)
+            size_shape = _rnd.randint(15, 100)
+            shape = _rnd.choice(['circle', 'triangle', 'square', 'line'])
             if shape == 'circle':
-                draw.ellipse([cx - size_shape, cy - size_shape,
-                              cx + size_shape, cy + size_shape],
-                             fill=color if random.random() > 0.4 else None,
-                             outline=(30, 30, 30), width=3)
+                draw.ellipse([cx - size_shape, cy - size_shape, cx + size_shape, cy + size_shape],
+                             fill=color if _rnd.random() > 0.4 else None, outline=(30, 30, 30), width=3)
             elif shape == 'triangle':
-                pts = [(cx, cy - size_shape), (cx - size_shape, cy + size_shape),
-                       (cx + size_shape, cy + size_shape)]
+                pts = [(cx, cy - size_shape), (cx - size_shape, cy + size_shape), (cx + size_shape, cy + size_shape)]
                 draw.polygon(pts, fill=color, outline=(30, 30, 30), width=3)
             elif shape == 'square':
-                draw.rectangle([cx - size_shape, cy - size_shape,
-                                cx + size_shape, cy + size_shape],
+                draw.rectangle([cx - size_shape, cy - size_shape, cx + size_shape, cy + size_shape],
                                fill=color, outline=(30, 30, 30), width=3)
             else:
-                ex, ey = random.randint(20, size - 20), random.randint(20, size - 20)
-                draw.line([cx, cy, ex, ey], fill=color, width=random.randint(2, 8))
-
+                ex, ey = _rnd.randint(20, size - 20), _rnd.randint(20, size - 20)
+                draw.line([cx, cy, ex, ey], fill=color, width=_rnd.randint(2, 8))
         draw.text((20, 20), data["title"], fill=(30, 30, 30))
         draw.text((20, 45), data["value_label"], fill=(80, 80, 80))
         return img
 
     def _art_mondrian_data(self, data: dict, size: int, palette: str) -> Image.Image:
-        """Mondrian where cell colors are mapped from data values."""
         if not data or data["n_points"] == 0:
             img = Image.new("RGB", (size, size), "#fff")
             ImageDraw.Draw(img).text((size // 2, size // 2), "No data", fill="#888")
             return img
-
+        import random as _rnd
+        _rnd.seed(42)
         img = Image.new("RGB", (size, size), (255, 255, 255))
         draw = ImageDraw.Draw(img)
         values = data["color_values"]
         v_min, v_max = min(values), max(values)
         v_range = v_max - v_min or 1
         line_w = 4
-
-        # Use data values to color cells
-        cols, rows = random.randint(3, 5), random.randint(3, 5)
+        cols, rows = _rnd.randint(3, 5), _rnd.randint(3, 5)
         n_cells = cols * rows
-        # Assign data values to cells (cycle if fewer data points)
         cell_values = [values[i % len(values)] for i in range(n_cells)]
 
         def subdivide(x, y, rw, rh, depth, cell_idx):
             if depth == 0 or (rw < 60 and rh < 60):
                 t = (cell_values[cell_idx % len(cell_values)] - v_min) / v_range
                 color = self._lerp_data_color(t, palette)
-                # Mix with white for Mondrian feel
-                if random.random() < 0.3:
+                if _rnd.random() < 0.3:
                     color = (255, 255, 255)
                 draw.rectangle([x, y, x + rw, y + rh], fill=color)
                 return
-            if random.random() < 0.5 and rw > 80:
-                split = random.randint(rw // 4, rw * 3 // 4)
+            if _rnd.random() < 0.5 and rw > 80:
+                split = _rnd.randint(rw // 4, rw * 3 // 4)
                 subdivide(x, y, split, rh, depth - 1, cell_idx)
                 subdivide(x + split, y, rw - split, rh, depth - 1, cell_idx + 1)
                 draw.line([x + split, y, x + split, y + rh], fill=(0, 0, 0), width=line_w)
             elif rh > 80:
-                split = random.randint(rh // 4, rh * 3 // 4)
+                split = _rnd.randint(rh // 4, rh * 3 // 4)
                 subdivide(x, y, rw, split, depth - 1, cell_idx)
                 subdivide(x, y + split, rw, rh - split, depth - 1, cell_idx + 1)
                 draw.line([x, y + split, x + rw, y + split], fill=(0, 0, 0), width=line_w)
@@ -2723,111 +2956,100 @@ class GarminViewerApp:
                 color = self._lerp_data_color(t, palette)
                 draw.rectangle([x, y, x + rw, y + rh], fill=color)
 
-        subdivide(0, 0, size, size, random.randint(4, 6), 0)
+        subdivide(0, 0, size, size, _rnd.randint(4, 6), 0)
         draw.rectangle([0, 0, size - 1, size - 1], outline=(0, 0, 0), width=line_w)
         draw.text((20, 20), data["title"], fill=(30, 30, 30))
         return img
 
     def _art_rothko_data(self, data: dict, size: int, palette: str) -> Image.Image:
-        """Rothko where band colors are mapped from data quantiles."""
         if not data or data["n_points"] == 0:
             img = Image.new("RGB", (size, size), "#0d1117")
             ImageDraw.Draw(img).text((size // 2, size // 2), "No data", fill="#888")
             return img
-
+        import random as _rnd
+        _rnd.seed(42)
         img = Image.new("RGB", (size, size), (40, 30, 30))
         draw = ImageDraw.Draw(img)
         values = data["color_values"]
         v_min, v_max = min(values), max(values)
         v_range = v_max - v_min or 1
-
         num_bands = max(2, min(5, data["n_points"]))
         band_h = size // num_bands
-        gap = random.randint(10, 30)
-
+        gap = _rnd.randint(10, 30)
         for i in range(num_bands):
-            # Map band index to a data quantile
             t = i / max(num_bands - 1, 1)
             color = self._lerp_data_color(t, palette)
             y0 = i * band_h + gap // 2
             y1 = (i + 1) * band_h - gap // 2
-            x0 = random.randint(0, 30)
-            x1 = size - random.randint(0, 30)
+            x0 = _rnd.randint(0, 30)
+            x1 = size - _rnd.randint(0, 30)
             for offset in range(5, 0, -1):
                 c = tuple(max(0, c - offset * 3) for c in color)
                 draw.rectangle([x0 + offset, y0 + offset, x1 - offset, y1 - offset], fill=c)
             draw.rectangle([x0, y0, x1, y1], fill=color)
-
-        img = img.filter(ImageFilter.GaussianBlur(radius=random.randint(8, 20)))
+        img = img.filter(ImageFilter.GaussianBlur(radius=_rnd.randint(8, 20)))
         draw = ImageDraw.Draw(img)
         draw.text((20, 20), data["title"], fill="#ffffff")
         draw.text((20, 45), data["value_label"], fill="#ccc")
         return img
 
     def _art_pollock_data(self, data: dict, size: int, palette: str) -> Image.Image:
-        """Pollock where stroke density and color follow data values."""
         if not data or data["n_points"] == 0:
             img = Image.new("RGB", (size, size), "#0d1117")
             ImageDraw.Draw(img).text((size // 2, size // 2), "No data", fill="#888")
             return img
-
+        import random as _rnd
+        _rnd.seed(42)
         img = Image.new("RGB", (size, size), (20, 18, 15))
         draw = ImageDraw.Draw(img)
         values = data["color_values"]
         v_min, v_max = min(values), max(values)
         v_range = v_max - v_min or 1
         n = len(values)
-
-        # Number of strokes proportional to data
         n_strokes = max(15, n * 2)
         for _ in range(n_strokes):
-            idx = random.randint(0, n - 1)
+            idx = _rnd.randint(0, n - 1)
             t = (values[idx] - v_min) / v_range
             color = self._lerp_data_color(t, palette)
-            width = random.randint(1, 6)
-            x, y = random.randint(0, size), random.randint(0, size)
+            width = _rnd.randint(1, 6)
+            x, y = _rnd.randint(0, size), _rnd.randint(0, size)
             points = [(x, y)]
-            for _ in range(random.randint(5, 20)):
-                x += random.randint(-80, 80)
-                y += random.randint(-80, 80)
+            for _ in range(_rnd.randint(5, 20)):
+                x += _rnd.randint(-80, 80)
+                y += _rnd.randint(-80, 80)
                 x = max(0, min(size - 1, x))
                 y = max(0, min(size - 1, y))
                 points.append((x, y))
             draw.line(points, fill=color, width=width, joint='curve')
-
-        # Dots
-        for _ in range(random.randint(200, 500)):
-            idx = random.randint(0, n - 1)
+        for _ in range(_rnd.randint(200, 500)):
+            idx = _rnd.randint(0, n - 1)
             t = (values[idx] - v_min) / v_range
             color = self._lerp_data_color(t, palette)
-            x, y = random.randint(0, size), random.randint(0, size)
-            r = random.randint(1, 5)
+            x, y = _rnd.randint(0, size), _rnd.randint(0, size)
+            r = _rnd.randint(1, 5)
             draw.ellipse([x - r, y - r, x + r, y + r], fill=color)
-
         draw.text((20, 20), data["title"], fill="#ffffff")
         draw.text((20, 45), data["value_label"], fill="#aaa")
         return img
 
     def _art_bauhaus_data(self, data: dict, size: int, palette: str) -> Image.Image:
-        """Bauhaus where grid cell colors are mapped from data."""
         if not data or data["n_points"] == 0:
             img = Image.new("RGB", (size, size), "#f5f0e6")
             ImageDraw.Draw(img).text((size // 2, size // 2), "No data", fill="#888")
             return img
-
+        import random as _rnd
+        _rnd.seed(42)
         img = Image.new("RGB", (size, size), (245, 240, 230))
         draw = ImageDraw.Draw(img)
         values = data["color_values"]
         v_min, v_max = min(values), max(values)
         v_range = v_max - v_min or 1
         n = len(values)
-
-        cols, rows = random.randint(3, 5), random.randint(3, 5)
+        cols, rows = _rnd.randint(3, 5), _rnd.randint(3, 5)
         cell_w, cell_h = size // cols, size // rows
-
         for row in range(rows):
             for col in range(cols):
-                if random.random() < 0.2:
+                if _rnd.random() < 0.2:
                     continue
                 idx = (row * cols + col) % n
                 t = (values[idx] - v_min) / v_range
@@ -2835,7 +3057,7 @@ class GarminViewerApp:
                 cx = col * cell_w + cell_w // 2
                 cy = row * cell_h + cell_h // 2
                 sz = min(cell_w, cell_h) // 2 - 5
-                shape = random.choice(['circle', 'half_circle', 'rect', 'arc'])
+                shape = _rnd.choice(['circle', 'half_circle', 'rect', 'arc'])
                 if shape == 'circle':
                     draw.ellipse([cx - sz, cy - sz, cx + sz, cy + sz],
                                  fill=color, outline=(30, 30, 30), width=2)
@@ -2843,24 +3065,22 @@ class GarminViewerApp:
                     draw.pieslice([cx - sz, cy - sz, cx + sz, cy + sz],
                                   180, 360, fill=color, outline=(30, 30, 30), width=2)
                 elif shape == 'rect':
-                    draw.rectangle([cx - sz, cy - sz, cx + sz, cy + sz],
-                                   fill=color, outline=(30, 30, 30), width=2)
+                    draw.rectangle([cx - sz, cy - sz, cx + sz, cy + sz], fill=color, outline=(30, 30, 30), width=2)
                 else:
                     draw.arc([cx - sz, cy - sz, cx + sz, cy + sz],
-                             0, random.choice([90, 180, 270]),
+                             0, _rnd.choice([90, 180, 270]),
                              fill=(30, 30, 30), width=4)
-
         draw.text((20, 20), data["title"], fill=(30, 30, 30))
         draw.text((20, 45), data["value_label"], fill=(80, 80, 80))
         return img
 
     def _art_wild_mix_data(self, data: dict, size: int, palette: str) -> Image.Image:
-        """Wild Mix where all sub-styles use data-driven colors."""
         if not data or data["n_points"] == 0:
             img = Image.new("RGB", (size, size), "#0d1117")
             ImageDraw.Draw(img).text((size // 2, size // 2), "No data", fill="#888")
             return img
-
+        import random as _rnd
+        _rnd.seed(42)
         img = Image.new("RGBA", (size, size), (255, 255, 255, 255))
         draw = ImageDraw.Draw(img)
         values = data["color_values"]
@@ -2868,29 +3088,27 @@ class GarminViewerApp:
         v_range = v_max - v_min or 1
         n = len(values)
 
-        # Background: Rothko bands from data
-        if random.random() > 0.5:
-            num_bands = random.randint(2, 4)
+        if _rnd.random() > 0.5:
+            num_bands = _rnd.randint(2, 4)
             band_h = size // num_bands
             for i in range(num_bands):
                 t = i / max(num_bands - 1, 1)
                 color = self._lerp_data_color(t, palette)
-                y0 = i * band_h + random.randint(5, 20)
-                y1 = (i + 1) * band_h - random.randint(5, 20)
+                y0 = i * band_h + _rnd.randint(5, 20)
+                y1 = (i + 1) * band_h - _rnd.randint(5, 20)
                 draw.rectangle([0, y0, size, y1], fill=color + (255,))
-            img = img.filter(ImageFilter.GaussianBlur(radius=random.randint(10, 25)))
+            img = img.filter(ImageFilter.GaussianBlur(radius=_rnd.randint(10, 25)))
             draw = ImageDraw.Draw(img)
         else:
             bg = self._lerp_data_color(0.1, palette)
             draw.rectangle([0, 0, size, size], fill=bg + (255,))
 
-        # Mondrian grid with data colors
-        if random.random() > 0.4:
-            cols, rows = random.randint(2, 4), random.randint(2, 4)
+        if _rnd.random() > 0.4:
+            cols, rows = _rnd.randint(2, 4), _rnd.randint(2, 4)
             cell_w, cell_h = size // cols, size // rows
             for row in range(rows):
                 for col in range(cols):
-                    if random.random() < 0.5:
+                    if _rnd.random() < 0.5:
                         idx = (row * cols + col) % n
                         t = (values[idx] - v_min) / v_range
                         color = self._lerp_data_color(t, palette)
@@ -2900,18 +3118,17 @@ class GarminViewerApp:
                                        fill=color + (180,),
                                        outline=(0, 0, 0, 200), width=3)
 
-        # Kandinsky shapes with data colors
-        if random.random() > 0.2:
-            for _ in range(random.randint(8, 20)):
-                idx = random.randint(0, n - 1)
+        if _rnd.random() > 0.2:
+            for _ in range(_rnd.randint(8, 20)):
+                idx = _rnd.randint(0, n - 1)
                 t = (values[idx] - v_min) / v_range
                 color = self._lerp_data_color(t, palette)
-                cx, cy = random.randint(20, size - 20), random.randint(20, size - 20)
-                sz = random.randint(15, 80)
-                shape = random.choice(['circle', 'triangle', 'square', 'line'])
+                cx, cy = _rnd.randint(20, size - 20), _rnd.randint(20, size - 20)
+                sz = _rnd.randint(15, 80)
+                shape = _rnd.choice(['circle', 'triangle', 'square', 'line'])
                 if shape == 'circle':
                     draw.ellipse([cx - sz, cy - sz, cx + sz, cy + sz],
-                                 fill=color + (255,) if random.random() > 0.3 else None,
+                                 fill=color + (255,) if _rnd.random() > 0.3 else None,
                                  outline=(30, 30, 30, 255), width=3)
                 elif shape == 'triangle':
                     pts = [(cx, cy - sz), (cx - sz, cy + sz), (cx + sz, cy + sz)]
@@ -2920,35 +3137,34 @@ class GarminViewerApp:
                     draw.rectangle([cx - sz, cy - sz, cx + sz, cy + sz],
                                    fill=color + (255,), outline=(30, 30, 30, 255), width=3)
                 else:
-                    ex, ey = random.randint(20, size - 20), random.randint(20, size - 20)
-                    draw.line([cx, cy, ex, ey], fill=color + (255,), width=random.randint(2, 8))
+                    ex, ey = _rnd.randint(20, size - 20), _rnd.randint(20, size - 20)
+                    draw.line([cx, cy, ex, ey], fill=color + (255,), width=_rnd.randint(2, 8))
 
-        # Pollock drips
-        if random.random() > 0.2:
-            for _ in range(random.randint(8, 20)):
-                idx = random.randint(0, n - 1)
+        if _rnd.random() > 0.2:
+            for _ in range(_rnd.randint(8, 20)):
+                idx = _rnd.randint(0, n - 1)
                 t = (values[idx] - v_min) / v_range
                 color = self._lerp_data_color(t, palette)
-                width = random.randint(1, 5)
-                x, y = random.randint(0, size), random.randint(0, size)
+                width = _rnd.randint(1, 5)
+                x, y = _rnd.randint(0, size), _rnd.randint(0, size)
                 points = [(x, y)]
-                for _ in range(random.randint(4, 15)):
-                    x += random.randint(-60, 60)
-                    y += random.randint(-60, 60)
+                for _ in range(_rnd.randint(4, 15)):
+                    x += _rnd.randint(-60, 60)
+                    y += _rnd.randint(-60, 60)
                     x = max(0, min(size - 1, x))
                     y = max(0, min(size - 1, y))
                     points.append((x, y))
                 draw.line(points, fill=color + (255,), width=width, joint='curve')
-            for _ in range(random.randint(100, 300)):
-                idx = random.randint(0, n - 1)
+            for _ in range(_rnd.randint(100, 300)):
+                idx = _rnd.randint(0, n - 1)
                 t = (values[idx] - v_min) / v_range
                 color = self._lerp_data_color(t, palette)
-                x, y = random.randint(0, size), random.randint(0, size)
-                r = random.randint(1, 4)
+                x, y = _rnd.randint(0, size), _rnd.randint(0, size)
+                r = _rnd.randint(1, 4)
                 draw.ellipse([x - r, y - r, x + r, y + r], fill=color + (255,))
 
-        if random.random() > 0.7:
-            img = img.filter(ImageFilter.GaussianBlur(radius=random.randint(1, 4)))
+        if _rnd.random() > 0.7:
+            img = img.filter(ImageFilter.GaussianBlur(radius=_rnd.randint(1, 4)))
 
         img = img.convert("RGB")
         draw = ImageDraw.Draw(img)
@@ -2956,22 +3172,18 @@ class GarminViewerApp:
         draw.text((20, 45), data["value_label"], fill="#ccc")
         return img
 
-    # ── Art generate / save ──
-
     def _on_generate_art(self):
         if not PIL_AVAILABLE:
             messagebox.showerror("Error", "Pillow not installed.\nRun: pip install Pillow")
             return
-
         style = self.art_style_var.get()
-
-        # Validate data availability
         data_key = self.art_data_var.get()
-        if style in ("daily_mosaic", "scribble", "kandinsky", "mondrian",
-                     "rothko", "pollock", "bauhaus", "wild_mix"):
+        if style in ("daily_mosaic", "scribble", "kandinsky",
+                     "mondrian", "rothko", "pollock", "bauhaus", "wild_mix"):
             dates = self._get_dates_for_data_source(data_key)
             if not dates:
-                self.art_info_var.set(f"❌ No {self._ART_DATA_SOURCES.get(data_key, data_key)} data.")
+                label = self._ART_DATA_LABELS.get(data_key, data_key)
+                self.art_info_var.set(f"❌ No {label} data.")
                 return
             if not self.art_period_select_var.get():
                 self.art_info_var.set("❌ Select a period from the dropdown.")
@@ -3000,9 +3212,10 @@ class GarminViewerApp:
 
                 def _show():
                     self.art_preview_label.config(image=self._art_photo, text="")
+                    label = self._ART_DATA_LABELS.get(data_key, data_key)
                     self.art_info_var.set(
                         f"✅ {img.size[0]}×{img.size[1]} px  |  {style}  |  "
-                        f"{self.art_data_var.get()}  |  {self.art_period_select_var.get()}")
+                        f"{label}  |  {self.art_period_select_var.get()}")
                 self.root.after(0, _show)
 
             except Exception as e:
@@ -3031,7 +3244,7 @@ class GarminViewerApp:
         if not path:
             return
         self._art_image.save(path)
-        self.art_info_var.set(f"💾 Saved: {Path(path).name}")   
+        self.art_info_var.set(f"💾 Saved: {Path(path).name}")    
         
     # ─── Overview Tab ───────────────────────────────────────────────────────
 
@@ -3044,6 +3257,32 @@ class GarminViewerApp:
         "Body Battery":   "#1a3a1a",
         "Blood Pressure": "#3a2a0a",
     }
+
+    def _bp_cell_bg(self, val_str, is_dia=False, is_pulse=False) -> str:
+        try:
+            v = float(val_str)
+        except (ValueError, TypeError):
+            return "#3a2a0a"
+        if is_pulse:
+            return "#2E7D32"
+        if is_dia:
+            if v >= 110:
+                return "#8B0000"
+            elif v >= 100:
+                return "#CC5500"
+            elif v >= 90:
+                return "#8B8B00"
+            else:
+                return "#2E7D32"
+        else:
+            if v >= 180:
+                return "#8B0000"
+            elif v >= 160:
+                return "#CC5500"
+            elif v >= 140:
+                return "#8B8B00"
+            else:
+                return "#2E7D32"
 
     def _build_overview_tab(self):
         frame = ttk.Frame(self.tab_overview)
@@ -3190,6 +3429,15 @@ class GarminViewerApp:
                             "rem_sleep_min", "awake_min"):
                     s = sub[col].dropna()
                     vals.append(self._fmt_hm(s.mean()) if not s.empty else "")
+                age = self.settings.get("age", 30)
+                scores = [
+                    compute_sleep_quality_score(r.deep_sleep_min, r.light_sleep_min,
+                                                r.rem_sleep_min, r.awake_min,
+                                                r.sleep_time_min, age)
+                    for r in sub.itertuples()
+                ]
+                scores = [s for s in scores if s is not None]
+                vals.append(f"{np.mean(scores):.0f}" if scores else "")
                 return vals
 
             def compute_resp(sub):
@@ -3236,7 +3484,7 @@ class GarminViewerApp:
                   "Min Min", "Min Max", "Min Avg"],
                  compute_stress),
                 ("Sleep", "sleep",
-                 ["Total", "Deep", "Light", "REM", "Awake"],
+                 ["Total", "Deep", "Light", "REM", "Awake", "Score"],
                  compute_sleep),
                 ("Respiration", "respiration",
                  ["Avg Min", "Avg Max", "Avg Avg",
@@ -3260,32 +3508,104 @@ class GarminViewerApp:
                 df["week"] = df["date"].apply(week_label)
                 df["month"] = df["date"].apply(month_label)
 
-                tree = self._make_section_tree(self.overview_notebook, sec_name, headers)
-                tag = f"sec_{sec_name.replace(' ', '_')}"
+                if sec_name == "Blood Pressure":
+                    tab = ttk.Frame(self.overview_notebook)
+                    self.overview_notebook.add(tab, text="  Blood Pressure  ")
 
-                months = sorted(df["month"].unique())
-                for mo in months:
-                    sub = df[df["month"] == mo]
-                    vals = compute_fn(sub)
-                    row_vals = [f"📅 {mo}"] + vals + [""] * (9 - len(vals))
-                    tree.insert("", tk.END, values=row_vals[:10], tags=(tag,))
-                    self._overview_export_data.append(
-                        {"section": sec_name, "type": "monthly",
-                         "period": mo, "values": vals, "headers": headers})
+                    canvas = tk.Canvas(tab, highlightthickness=0)
+                    ysb = tk.Scrollbar(tab, orient=tk.VERTICAL, command=canvas.yview)
+                    inner = tk.Frame(canvas)
+                    inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+                    canvas.create_window((0, 0), window=inner, anchor="nw")
+                    canvas.configure(yscrollcommand=ysb.set)
+                    canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+                    ysb.pack(side=tk.RIGHT, fill=tk.Y)
 
-                tree.insert("", tk.END, values=[""] * 10, tags=())
+                    all_headers = ["Period"] + headers
+                    for col, text in enumerate(all_headers):
+                        lbl = tk.Label(inner, text=text, bg="#3a2a0a", fg="#ffffff",
+                                       font=("TkDefaultFont", 9, "bold"),
+                                       relief=tk.RAISED, padx=10, pady=4)
+                        lbl.grid(row=0, column=col, sticky="nsew")
 
-                weeks = sorted(df["week"].unique())
-                for wk in weeks:
-                    sub = df[df["week"] == wk]
-                    vals = compute_fn(sub)
-                    row_vals = [wk] + vals + [""] * (9 - len(vals))
-                    tree.insert("", tk.END, values=row_vals[:10], tags=(tag,))
-                    self._overview_export_data.append(
-                        {"section": sec_name, "type": "weekly",
-                         "period": wk, "values": vals, "headers": headers})
+                    row_idx = 1
+                    months = sorted(df["month"].unique())
+                    for mo in months:
+                        sub = df[df["month"] == mo]
+                        vals = compute_fn(sub)
+                        lbl = tk.Label(inner, text=f"📅 {mo}", bg="#3a2a0a", fg="#ffffff",
+                                       font=("TkDefaultFont", 9, "bold"),
+                                       relief=tk.RAISED, padx=10, pady=4)
+                        lbl.grid(row=row_idx, column=0, sticky="nsew")
+                        for i, val in enumerate(vals):
+                            is_dia = (3 <= i < 6)
+                            is_pulse = (i >= 6)
+                            cell_bg = self._bp_cell_bg(val, is_dia=is_dia, is_pulse=is_pulse)
+                            lbl = tk.Label(inner, text=val, bg=cell_bg, fg="#ffffff",
+                                           font=("TkDefaultFont", 9),
+                                           relief=tk.RAISED, padx=10, pady=4)
+                            lbl.grid(row=row_idx, column=i + 1, sticky="nsew")
+                        self._overview_export_data.append(
+                            {"section": sec_name, "type": "monthly",
+                             "period": mo, "values": vals, "headers": headers})
+                        row_idx += 1
 
-                tree.insert("", tk.END, values=[""] * 10, tags=())
+                    for col in range(len(all_headers)):
+                        lbl = tk.Label(inner, text="", bg="#2a2a2a",
+                                       relief=tk.RAISED, padx=10, pady=2)
+                        lbl.grid(row=row_idx, column=col, sticky="nsew")
+                    row_idx += 1
+
+                    weeks = sorted(df["week"].unique())
+                    for wk in weeks:
+                        sub = df[df["week"] == wk]
+                        vals = compute_fn(sub)
+                        lbl = tk.Label(inner, text=wk, bg="#3a2a0a", fg="#ffffff",
+                                       font=("TkDefaultFont", 9),
+                                       relief=tk.RAISED, padx=10, pady=4)
+                        lbl.grid(row=row_idx, column=0, sticky="nsew")
+                        for i, val in enumerate(vals):
+                            is_dia = (3 <= i < 6)
+                            is_pulse = (i >= 6)
+                            cell_bg = self._bp_cell_bg(val, is_dia=is_dia, is_pulse=is_pulse)
+                            lbl = tk.Label(inner, text=val, bg=cell_bg, fg="#ffffff",
+                                           font=("TkDefaultFont", 9),
+                                           relief=tk.RAISED, padx=10, pady=4)
+                            lbl.grid(row=row_idx, column=i + 1, sticky="nsew")
+                        self._overview_export_data.append(
+                            {"section": sec_name, "type": "weekly",
+                             "period": wk, "values": vals, "headers": headers})
+                        row_idx += 1
+
+                    self._overview_headers[sec_name] = headers
+
+                else:
+                    tree = self._make_section_tree(self.overview_notebook, sec_name, headers)
+                    tag = f"sec_{sec_name.replace(' ', '_')}"
+
+                    months = sorted(df["month"].unique())
+                    for mo in months:
+                        sub = df[df["month"] == mo]
+                        vals = compute_fn(sub)
+                        row_vals = [f"📅 {mo}"] + vals + [""] * (9 - len(vals))
+                        tree.insert("", tk.END, values=row_vals[:10], tags=(tag,))
+                        self._overview_export_data.append(
+                            {"section": sec_name, "type": "monthly",
+                             "period": mo, "values": vals, "headers": headers})
+
+                    tree.insert("", tk.END, values=[""] * 10, tags=())
+
+                    weeks = sorted(df["week"].unique())
+                    for wk in weeks:
+                        sub = df[df["week"] == wk]
+                        vals = compute_fn(sub)
+                        row_vals = [wk] + vals + [""] * (9 - len(vals))
+                        tree.insert("", tk.END, values=row_vals[:10], tags=(tag,))
+                        self._overview_export_data.append(
+                            {"section": sec_name, "type": "weekly",
+                             "period": wk, "values": vals, "headers": headers})
+
+                    tree.insert("", tk.END, values=[""] * 10, tags=())
 
             self.root.after(0, lambda: self.overview_info_var.set("✅ Done"))
 
@@ -3331,6 +3651,47 @@ class GarminViewerApp:
                     t_b.addElement(TextProperties(fontweight="bold"))
                     doc.automaticstyles.addElement(t_b)
 
+                bp_colors = {
+                    "bp_green":  "#2E7D32",
+                    "bp_yellow": "#8B8B00",
+                    "bp_orange": "#CC5500",
+                    "bp_red":    "#8B0000",
+                }
+                for name, color in bp_colors.items():
+                    s = Style(name=f"cell_{name}", family="table-cell")
+                    s.addElement(TableCellProperties(backgroundcolor=color))
+                    doc.automaticstyles.addElement(s)
+                    s_b = Style(name=f"cellb_{name}", family="table-cell")
+                    s_b.addElement(TableCellProperties(backgroundcolor=color))
+                    doc.automaticstyles.addElement(s_b)
+
+                def _bp_style(val_str, col_idx, bold=False):
+                    try:
+                        v = float(val_str)
+                    except (ValueError, TypeError):
+                        return None
+                    if col_idx >= 6:
+                        name = "bp_green"
+                    elif col_idx >= 3:
+                        if v >= 110:
+                            name = "bp_red"
+                        elif v >= 100:
+                            name = "bp_orange"
+                        elif v >= 90:
+                            name = "bp_yellow"
+                        else:
+                            name = "bp_green"
+                    else:
+                        if v >= 180:
+                            name = "bp_red"
+                        elif v >= 160:
+                            name = "bp_orange"
+                        elif v >= 140:
+                            name = "bp_yellow"
+                        else:
+                            name = "bp_green"
+                    return f"cellb_{name}" if bold else f"cell_{name}"
+
                 sections_order = []
                 for entry in self._overview_export_data:
                     if entry["section"] not in sections_order:
@@ -3343,6 +3704,7 @@ class GarminViewerApp:
                     style_normal = styles[key]
                     style_bold = styles[f"{key}_bold"]
                     text_bold = f"text_{key}_bold"
+                    is_bp = (sec_name == "Blood Pressure")
 
                     table = Table(name=sec_name[:31])
 
@@ -3366,7 +3728,11 @@ class GarminViewerApp:
                         row.addElement(pcell)
                         for i in range(len(headers)):
                             v = entry["values"][i] if i < len(entry["values"]) else ""
-                            cell = TableCell(stylename=style_bold)
+                            if is_bp:
+                                cell_style = _bp_style(v, i, bold=True) or style_bold
+                            else:
+                                cell_style = style_bold
+                            cell = TableCell(stylename=cell_style)
                             cell.addElement(P(text=v, stylename=text_bold))
                             row.addElement(cell)
                         table.addElement(row)
@@ -3381,8 +3747,12 @@ class GarminViewerApp:
                         row.addElement(pcell)
                         for i in range(len(headers)):
                             v = entry["values"][i] if i < len(entry["values"]) else ""
-                            cell = TableCell(stylename=style_normal)
-                            cell.addElement(P(text=v))
+                            if is_bp:
+                                cell_style = _bp_style(v, i, bold=False) or style_normal
+                            else:
+                                cell_style = style_normal
+                            cell = TableCell(stylename=cell_style)
+                            cell.addElement(P(text=v, stylename=text_bold))
                             row.addElement(cell)
                         table.addElement(row)
 
@@ -3395,9 +3765,8 @@ class GarminViewerApp:
                 err_msg = str(e)
                 self.root.after(0, lambda: messagebox.showerror("Export Error", err_msg))
 
-        threading.Thread(target=work, daemon=True).start()
-
-
+        threading.Thread(target=work, daemon=True).start()   
+        
 # ═══════════════════════════════════════════════════════════════════════════════
 #  MAIN
 # ═══════════════════════════════════════════════════════════════════════════════
