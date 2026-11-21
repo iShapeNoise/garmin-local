@@ -1,1 +1,3 @@
-data/
+# Ignore everything inside data/ EXCEPT .gitkeep
+data/*
+!data/.gitkeep   
